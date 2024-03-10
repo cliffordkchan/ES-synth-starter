@@ -3,6 +3,11 @@
 #include <stm32l4xx_hal_gpio.h>
 #include <stm32l4xx_hal_cortex.h>
 
+/*
+There is no high-level, Arduino-like API for the CAN bus, so the starter code includes a basic library that wraps the relevant HAL module. 
+Only some of the features of the hardware are exposed by this library.
+*/
+
 //Overwrite the weak default IRQ Handlers and callabcks
 extern "C" void CAN1_RX0_IRQHandler(void);
 extern "C" void CAN1_TX_IRQHandler(void);

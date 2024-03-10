@@ -3,7 +3,9 @@
 #include <bitset>
 #include <map>
 #include <string>
+#include <cstring> // for memcpy
 #include <STM32FreeRTOS.h>
+#include "../lib/ES_CAN/ES_CAN.h"
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -55,13 +57,18 @@
 
 // global variables
   volatile uint32_t currentStepSize;
-  volatile uint8_t TX_Message[8] = {0}; // stores an outgoing message
+  // volatile uint8_t TX_Message[8] = {0}; // stores an outgoing message
+  QueueHandle_t msgInQ; // queue handler for receiver
+  QueueHandle_t msgOutQ; // queue handler for transmission
+  // uint8_t RX_Message[8]={0};  //This isn’t safe synchronisation because there is no guard against simultaneous access. 
+                              //But it will be ok to test with since the only consequence of a collision would be the printing of a partial message
 
 // store system state that is used in more than one thread
 struct {
   std::bitset<32> inputs;
   int8_t rotation;  // maybe i shld have more rotations?
   SemaphoreHandle_t mutex;  
+  uint8_t RX_Message[8]={0}; // Does this only initialise or does it constantly get set to 0?
 } sysState;
 
 // TODO make a knob class
@@ -163,6 +170,14 @@ void sampleISR() {
   analogWrite(OUTR_PIN, Vout + 128);
 }
 
+// Incoming CAN messages will be written into the queue in an ISR
+void CAN_RX_ISR (void) {
+	uint8_t RX_Message_ISR[8];
+	uint32_t ID;
+	CAN_RX(ID, RX_Message_ISR);
+	xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
+}
+
 std::bitset<4> readCols(){
   std::bitset<4> result;
 
@@ -195,6 +210,7 @@ void scanKeysTask(void * pvParameters) {
   int8_t rotation = 0;
   std::bitset<4> combinedBits;  // what a terrible name. for prev and current rotation
   int8_t rotationVariable;
+  uint8_t TX_Message[8]={0}; // stores an outgoing message
 
   while (1){
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
@@ -212,12 +228,21 @@ void scanKeysTask(void * pvParameters) {
         sysState.inputs[4*i+j] = cols[j];
         if (cols[j]==0){
           localCurrentStepSize = stepSizes[4*i+j];
+          TX_Message[2] = 4*i+j; // store	Note number 0-11
         }
       }
       xSemaphoreGive(sysState.mutex);
     }
     __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
     __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
+
+    // store state of key press or releases
+    if (localCurrentStepSize == 0){
+      TX_Message[0] = 'R';   // converts to 0x50 for P (key pressed), and 0x52 for R (Key released). ASCII
+    }
+    else{
+      TX_Message[0] = 'P';
+    }
 
     // knob 3
     setRow(3);
@@ -259,15 +284,20 @@ void scanKeysTask(void * pvParameters) {
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);  
     if (sysState.rotation + rotationVariable < 9 && sysState.rotation + rotationVariable >= 0) { // upper and lower limits
       sysState.rotation += rotationVariable;
+      if (localCurrentStepSize != 0){ // only update when a key is pressed
+        TX_Message[1] = sysState.rotation; // 	store Octave number 0-8
+      }
     }
     xSemaphoreGive(sysState.mutex);
+    CAN_TX(0x123, TX_Message); // send the message over the bus. CAN message ID is fixed as 0x123 
   }
 }
 
 void displayUpdateTask(void * pvParameters){
   const TickType_t xFrequency = 100/portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
-
+  uint32_t ID;
+  // uint8_t RX_Message[8]={0};
   while (1){
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
     //Update display
@@ -288,13 +318,54 @@ void displayUpdateTask(void * pvParameters){
     xSemaphoreGive(sysState.mutex);
     // u8g2.print(knob3.readRotation()); // reads current rotation value
 
+    // display octave and note number
+    // while (CAN_CheckRXLevel()){ 
+	  //   CAN_RX(ID, RX_Message);
+    // }
+    u8g2.setCursor(66,30);
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY);  
+    u8g2.print((char) sysState.RX_Message[0]);
+    u8g2.print(sysState.RX_Message[1]);
+    u8g2.print(sysState.RX_Message[2]);
+    xSemaphoreGive(sysState.mutex);
+
     // note played
     u8g2.setCursor(2,30);
     u8g2.print(notesMap[static_cast<uint32_t>(currentStepSize)].c_str());
-    u8g2.sendBuffer();          // transfer internal memory to the display
+
+    // transfer internal memory to the display
+    u8g2.sendBuffer();
 
     //Toggle LED
     digitalToggle(LED_BUILTIN);
+  }
+}
+
+void decodeTask(void * pvParameters){
+  uint32_t localCurrentStepSize;
+  uint8_t local_RX_Message[8]={0};
+  while(1){
+    xQueueReceive(msgInQ, local_RX_Message, portMAX_DELAY);
+
+    // see if this is a bad use of mutex, cuz there's another atomic store in here. Can I not just use local_RX_Message for the conditionals lol
+    xSemaphoreTake(sysState.mutex, portMAX_DELAY); 
+    for (int i = 0; i < 8; i++) {
+      sysState.RX_Message[i] = local_RX_Message[i];
+    }
+    if (sysState.RX_Message[0] == 'R'){
+      currentStepSize = 0;
+    }
+    else {
+      // changes octaves. Once knob classes are done, [1] should not be linked to volume
+      if (sysState.RX_Message[1]-4 < 0){
+        localCurrentStepSize = stepSizes[sysState.RX_Message[2]] >> (4-sysState.RX_Message[1]);
+      }
+      else{
+        localCurrentStepSize = stepSizes[sysState.RX_Message[2]] << (sysState.RX_Message[1]-4);
+      }
+      __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+    }
+    xSemaphoreGive(sysState.mutex);
   }
 }
 
@@ -337,6 +408,19 @@ void setup() {
   // Create the mutex 
   sysState.mutex = xSemaphoreCreateMutex();
 
+  // initialise CAN bus
+  CAN_Init(true); //True: loopback mode. receive and acknowledge its own messages. 
+                  // False: disables loopback mode and allow the MCUs to receive each others’ messages.
+  setCANFilter(0x123,0x7ff);  //initialises the reception ID filter. only messages with the ID 0x123 will be received. 
+                              // The second parameter is the mask, and 0x7ff means that every bit of the ID must match the filter for the message to be accepted
+  CAN_RegisterRX_ISR(CAN_RX_ISR); // called whenever a CAN message is received by passing a pointer to the relevant library function.
+  CAN_Start();
+
+  // initialise queue handler for CAN bus msgs
+  msgInQ = xQueueCreate(36,8); // Minimum time to send a CAN frame is ~0.7ms, so a queue length of 36 will take at least 25ms to fill; 
+                                // second param: size of each item in BYTES.
+  msgOutQ = xQueueCreate(36, 8);
+
   // uncomment for sound. Its the timer
   TIM_TypeDef *Instance = TIM1;
   HardwareTimer *sampleTimer = new HardwareTimer(Instance);
@@ -361,8 +445,18 @@ void setup() {
     "scanKeys",		/* Text name for the task */
     64,      		/* Stack size in words, not bytes */
     NULL,			/* Parameter passed into the task */
-    2,			/* Task priority */
+    3,			/* Task priority */
     &scanKeysHandle /* Pointer to store the task handle */
+  );
+
+  TaskHandle_t decodeTaskHandle = NULL;
+  xTaskCreate(
+    decodeTask,		/* Function that implements the task */
+    "decodeTask",		/* Text name for the task */
+    64,      		/* Stack size in words, not bytes */
+    NULL,			/* Parameter passed into the task */
+    2,			/* Task priority */
+    &decodeTaskHandle /* Pointer to store the task handle */
   );
 
   vTaskStartScheduler();
