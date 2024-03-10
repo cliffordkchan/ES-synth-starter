@@ -7,6 +7,15 @@
 #include <STM32FreeRTOS.h>
 #include "../lib/ES_CAN/ES_CAN.h"
 
+/*
+skipped:
+knob class
+2.6: Synthesiser modules should be configurable as senders or receivers. easiest to do this with preprocessor directives (e.g. #ifdef), 
+    but it may be more user friendly to allow the mode to be changed at runtime. 
+    You could also support auto-configuration with the handshake signals to define roles in a multi-module keyboard. 
+    There should also be a method of choosing the octave number of a module.
+*/
+
 //Constants
   const uint32_t interval = 100; //Display update interval
   const uint32_t stepSizes [] = {51076056, 54113197, 57330935, 60740010, 64351799, 68178356, 72232452, 76527617, 81078186, 85899346, 91007189, 96418755};
@@ -57,11 +66,9 @@
 
 // global variables
   volatile uint32_t currentStepSize;
-  // volatile uint8_t TX_Message[8] = {0}; // stores an outgoing message
   QueueHandle_t msgInQ; // queue handler for receiver
   QueueHandle_t msgOutQ; // queue handler for transmission
-  // uint8_t RX_Message[8]={0};  //This isn’t safe synchronisation because there is no guard against simultaneous access. 
-                              //But it will be ok to test with since the only consequence of a collision would be the printing of a partial message
+  SemaphoreHandle_t CAN_TX_Semaphore; // transmit thread will use a semaphore to check when it can place a message in the outgoing mailbox
 
 // store system state that is used in more than one thread
 struct {
@@ -289,7 +296,14 @@ void scanKeysTask(void * pvParameters) {
       }
     }
     xSemaphoreGive(sysState.mutex);
-    CAN_TX(0x123, TX_Message); // send the message over the bus. CAN message ID is fixed as 0x123 
+    // CAN_TX(0x123, TX_Message); // send the message over the bus. CAN message ID is fixed as 0x123 
+    /*
+    If you look in the library you’ll see that the above function (CAN_TX(0x123, TX_Message);) polls until there is space in the outgoing mailbox to place the message in. 
+    So if you send a lot of messages at the same time, scanKeysTask() might get stuck waiting for the bus to become available. 
+    It also not a thread safe function and its behaviour could be undefined if messages are being sent from two different threads. 
+    A queue is useful here too so that messages can be queued up for transmission.
+    */
+    xQueueSend( msgOutQ, TX_Message, portMAX_DELAY); // RTOS function to place an item on the transmit queue
   }
 }
 
@@ -369,6 +383,19 @@ void decodeTask(void * pvParameters){
   }
 }
 
+void CAN_TX_Task (void * pvParameters) { // two blocking statements because it must obtain a message from the queue and take the semaphore before sending the message
+	uint8_t msgOut[8];
+	while (1) {
+		xQueueReceive(msgOutQ, msgOut, portMAX_DELAY); // obtain a message from the queue
+		xSemaphoreTake(CAN_TX_Semaphore, portMAX_DELAY); // and take the semaphore before sending the message
+		CAN_TX(0x123, msgOut);
+	}
+}
+
+// ISR which will give the semaphore each time a mailbox becomes available
+void CAN_TX_ISR (void) {
+	xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
+}
 // determine the amount of stack to allocate to a thread:
 // uxTaskGetStackHighWaterMark() returns the largest amount of stack that a thread has ever needed. 
 //You can allocate a large stack at first and then optimise when the code is working. 
@@ -405,7 +432,7 @@ void setup() {
   Serial.begin(9600);
   Serial.println("Hello World");
 
-  // Create the mutex 
+  // Create the mutex for sysState
   sysState.mutex = xSemaphoreCreateMutex();
 
   // initialise CAN bus
@@ -414,12 +441,15 @@ void setup() {
   setCANFilter(0x123,0x7ff);  //initialises the reception ID filter. only messages with the ID 0x123 will be received. 
                               // The second parameter is the mask, and 0x7ff means that every bit of the ID must match the filter for the message to be accepted
   CAN_RegisterRX_ISR(CAN_RX_ISR); // called whenever a CAN message is received by passing a pointer to the relevant library function.
+  CAN_RegisterTX_ISR(CAN_TX_ISR);
   CAN_Start();
 
   // initialise queue handler for CAN bus msgs
   msgInQ = xQueueCreate(36,8); // Minimum time to send a CAN frame is ~0.7ms, so a queue length of 36 will take at least 25ms to fill; 
                                 // second param: size of each item in BYTES.
   msgOutQ = xQueueCreate(36, 8);
+  //  maxCount == 3 so it can’t accumulate a count greater than the number of mailboxes. Why need both init and max? why not assume init is max?
+  CAN_TX_Semaphore = xSemaphoreCreateCounting(3,3); // initialised to 3, so can be taken 3 times by transmit thread, and blocked on the fourth attempt.
 
   // uncomment for sound. Its the timer
   TIM_TypeDef *Instance = TIM1;
@@ -445,7 +475,7 @@ void setup() {
     "scanKeys",		/* Text name for the task */
     64,      		/* Stack size in words, not bytes */
     NULL,			/* Parameter passed into the task */
-    3,			/* Task priority */
+    4,			/* Task priority */
     &scanKeysHandle /* Pointer to store the task handle */
   );
 
@@ -455,8 +485,18 @@ void setup() {
     "decodeTask",		/* Text name for the task */
     64,      		/* Stack size in words, not bytes */
     NULL,			/* Parameter passed into the task */
-    2,			/* Task priority */
+    3,			/* Task priority 25.2 ms*/
     &decodeTaskHandle /* Pointer to store the task handle */
+  );
+
+  TaskHandle_t CAN_TX_TaskHandle = NULL;
+  xTaskCreate(
+    CAN_TX_Task,		/* Function that implements the task */
+    "CAN_TX_Task",		/* Text name for the task */
+    64,      		/* Stack size in words, not bytes */
+    NULL,			/* Parameter passed into the task */
+    2,			/* Task priority. 60ms*/
+    &CAN_TX_TaskHandle /* Pointer to store the task handle */
   );
 
   vTaskStartScheduler();
