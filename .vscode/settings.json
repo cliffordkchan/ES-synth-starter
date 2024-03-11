@@ -1,5 +1,6 @@
 {
     "files.associations": {
+        ".fantomasignore": "ignore",
         "array": "cpp",
         "atomic": "cpp",
         "bit": "cpp",
@@ -44,6 +45,7 @@
         "streambuf": "cpp",
         "cinttypes": "cpp",
         "typeinfo": "cpp",
-        "map": "cpp"
+        "map": "cpp",
+        "cstring": "cpp"
     }
 }

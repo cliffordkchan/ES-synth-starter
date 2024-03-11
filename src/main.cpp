@@ -7,6 +7,12 @@
 #include <STM32FreeRTOS.h>
 #include "../lib/ES_CAN/ES_CAN.h"
 
+// comment these out if not testing
+// #define DISABLE_THREADS
+// #define DISABLE_SOUND_ISR
+// #define DISABLE_CAN_ISR
+// #define TEST_SCANKEYS
+
 /*
 skipped:
 knob class
@@ -17,10 +23,12 @@ knob class
 */
 
 //Constants
+  const bool loopbackState = true;
   const uint32_t interval = 100; //Display update interval
   const uint32_t stepSizes [] = {51076056, 54113197, 57330935, 60740010, 64351799, 68178356, 72232452, 76527617, 81078186, 85899346, 91007189, 96418755};
 
   // Add information to the OLED display to show which note is selected.
+  // TODO: how to make this work with different octaves?
   std::map<uint32_t, std::string> notesMap = {
     {51076056, "C"}, 
     {54113197, "C#"}, 
@@ -82,75 +90,91 @@ struct {
 // Update the rotation value using the latest state of the quadrature inputs
 // Set upper and lower limits
 // Read the current rotation value
-// class Knob {
-//   private:
-//     std::bitset<2> prevState;
-//     std::bitset<4> combinedBits;
-//     int8_t rotation; // I dont like this
-//     int8_t rotationVariable;
-//     int8_t upperLimit;
-//     int8_t lowerLimit;
-//   public: 
-//     Knob(int lower, int upper): prevState(0b00), rotation(0), rotationVariable(0), upperLimit(upper), lowerLimit(lower){
-//     }
+class Knob {    //TODO implement this
+  private:
+      int8_t limUpper;
+      int8_t limLower;
+      struct {
+        int8_t delta;
+        std::bitset<4> stateTransition; 
+        std::bitset<2> prevState;
+        int8_t rotation;
+        SemaphoreHandle_t mutex;
+      } knobState;
+  public:
+      // Constructor
+      Knob(int initialValue, int upperLimit, int lowerLimit) {    //In setup i.e. knob3, "Knob knob3(0,8,0)"  
+          
+          limUpper = upperLimit;
+          limLower = lowerLimit;
+          knobState.stateTransition = 0;
+          knobState.prevState = 0;
+          knobState.rotation = initialValue;
+          knobState.mutex = xSemaphoreCreateMutex();
+      }
+      // Function to update the knob value
+      void updateRotation(std::bitset<2> currentState) { //delta to be +-1, the latest state of the quadrature inputs
+          xSemaphoreTake(knobState.mutex, portMAX_DELAY);  // Lock the mutex (when out of scope it unlocks)
+          knobState.stateTransition[3] = knobState.prevState[1];
+          knobState.stateTransition[2] = knobState.prevState[0];
+          knobState.stateTransition[1] = currentState[1];
+          knobState.stateTransition[0] = currentState[0];
 
-//     void setLimits(int newLower, int newUpper){
-//       upperLimit = newUpper;
-//       lowerLimit = newLower;
-//     }
+          switch (knobState.stateTransition.to_ulong()){
+            case 0b0001: 
+              knobState.delta = 1;
+              break;
+            case 0b0100:
+              knobState.delta = -1;
+              break;
+            case 0b1011: 
+              knobState.delta = -1;
+              break;
+            case 0b1110: 
+              knobState.delta = 1;
+              break;
+            // "Impossible" transitions. no change to delta
+            case 0b0011:
+              break;
+            case 0b0110:
+              break;
+            case 0b1001:
+              break;
+            case 0b1100:
+              break;
+            default:
+              knobState.delta = 0;
+              break;
+          }
+          //Assign the current state to the previous state once decoding is complete
+          knobState.prevState[0] = currentState[0];
+          knobState.prevState[1] = currentState[1];
+          //xSemaphoreGive(sysState.mutex);   //TODO setup knob.mutex
+          knobState.rotation += knobState.delta;
 
-//     // int8_t readRotation(){ // sth wrong
-//     //   xSemaphoreTake(sysState.mutex, portMAX_DELAY);  
-//     //   rotation = sysState.rotation;
-//     //   xSemaphoreGive(sysState.mutex);
-//     //   return rotation;
-//     // }
+          // Check and limit the knob value within the specified range
+          if (knobState.rotation > limUpper) {
+              knobState.rotation = limUpper;
+          } 
+          else if (knobState.rotation < limLower) {
+              knobState.rotation = limLower;
+          }
+          xSemaphoreGive(knobState.mutex);
+      }
 
-//     void updateRotation(std::bitset<4> cols){
-//       combinedBits[3] = prevState[1];
-//       combinedBits[2] = prevState[0];
-//       combinedBits[1] = cols[1];
-//       combinedBits[0] = cols[0];
-//       switch (combinedBits.to_ulong()){
-//         case 0b0001: 
-//           rotationVariable = 1;
-//           break;
-//         case 0b0100:
-//           rotationVariable = -1;
-//           break;
-//         case 0b1011: 
-//           rotationVariable = -1;
-//           break;
-//         case 0b1110: 
-//           rotationVariable = 1;
-//           break;
-//         // "Impossible" transitions. no change to rotation
-//         case 0b0011:
-//           break;
-//         case 0b0110:
-//           break;
-//         case 0b1001:
-//           break;
-//         case 0b1100:
-//           break;
-//         default:
-//           rotationVariable = 0;
-//           break;
-//       }
-//       //Assign the current state to the previous state once decoding is complete
-//       prevState[0] = cols[0];
-//       prevState[1] = cols[1];
-//       // update rotation  
-//       xSemaphoreTake(sysState.mutex, portMAX_DELAY);  
-//       if (sysState.rotation + rotationVariable < upperLimit && sysState.rotation + rotationVariable >= lowerLimit) { // upper and lower limits
-//         sysState.rotation += rotationVariable;
-//       }
-//       xSemaphoreGive(sysState.mutex);
-//     }
-// };
+      // Function to read the current knob value
+      int8_t readRotation() const {
+          // xSemaphoreTake(mutex, portMAX_DELAY);  // Lock the mutex
+          // int8_t currentRotation = rotation;    //locking mutex requires one extra variable
+          // xSemaphoreGive(mutex);
+          int8_t currentRotation = __atomic_load_n(&knobState.rotation, __ATOMIC_RELAXED);
+          return currentRotation;
+      }
+};
 
-// // Knobs
-// Knob knob3(0,9);
+// Knobs
+Knob knob3(0, 8, 0); // volume
+Knob knob2(0, 8, 0); // octave
 
 //Display driver object
 U8G2_SSD1305_128X32_NONAME_F_HW_I2C u8g2(U8G2_R0);
@@ -167,12 +191,13 @@ void setOutMuxBit(const uint8_t bitIdx, const bool value) {
       digitalWrite(REN_PIN,LOW);
 }
 
-// Interrupt service
+// =================================================Interrupt services======================================================
 void sampleISR() {
   static uint32_t phaseAcc = 0;
   phaseAcc += currentStepSize;
   int32_t Vout = (phaseAcc >> 24) - 128;
-  int8_t knob3Rotation = __atomic_load_n(&sysState.rotation, __ATOMIC_RELAXED);
+  // int8_t knob3Rotation = __atomic_load_n(&sysState.rotation, __ATOMIC_RELAXED);
+  int8_t knob3Rotation = knob3.readRotation();
   Vout = Vout >> (8 - knob3Rotation);
   analogWrite(OUTR_PIN, Vout + 128);
 }
@@ -185,6 +210,12 @@ void CAN_RX_ISR (void) {
 	xQueueSendFromISR(msgInQ, RX_Message_ISR, NULL);
 }
 
+// ISR which will give the semaphore each time a mailbox becomes available
+void CAN_TX_ISR (void) {
+	xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
+}
+
+//=========================================================Key selection=================================================
 std::bitset<4> readCols(){
   std::bitset<4> result;
 
@@ -205,7 +236,7 @@ void setRow(uint8_t rowIdx){
 
   digitalWrite(REN_PIN,HIGH);
 }
-
+// ======================================================Thread functions=================================================
 // scans 12 keys + knob 3
 void scanKeysTask(void * pvParameters) {
   // local vars
@@ -213,6 +244,7 @@ void scanKeysTask(void * pvParameters) {
   TickType_t xLastWakeTime = xTaskGetTickCount();
   std::bitset<4> cols;
   std::bitset<2> prevState = 0b00;
+  std::bitset<2> currentState = 0b00;
   uint32_t localCurrentStepSize;
   int8_t rotation = 0;
   std::bitset<4> combinedBits;  // what a terrible name. for prev and current rotation
@@ -233,6 +265,9 @@ void scanKeysTask(void * pvParameters) {
       // also can MAYBE use the C function memcpy() or C++ std::copy for this purpose. 
       for (int j=0; j<4; j++){
         sysState.inputs[4*i+j] = cols[j];
+        #ifdef TEST_SCANKEYS
+        cols[j] = 1;
+        #endif
         if (cols[j]==0){
           localCurrentStepSize = stepSizes[4*i+j];
           TX_Message[2] = 4*i+j; // store	Note number 0-11
@@ -251,51 +286,19 @@ void scanKeysTask(void * pvParameters) {
       TX_Message[0] = 'P';
     }
 
-    // knob 3
+    // knob 3 and 2
     setRow(3);
     cols = readCols();
-    combinedBits[3] = prevState[1];
-    combinedBits[2] = prevState[0];
-    combinedBits[1] = cols[1];
-    combinedBits[0] = cols[0];
-    switch (combinedBits.to_ulong()){
-      case 0b0001: 
-        rotationVariable = 1;
-        break;
-      case 0b0100:
-        rotationVariable = -1;
-        break;
-      case 0b1011: 
-        rotationVariable = -1;
-        break;
-      case 0b1110: 
-        rotationVariable = 1;
-        break;
-      // "Impossible" transitions. no change to rotation
-      case 0b0011:
-        break;
-      case 0b0110:
-        break;
-      case 0b1001:
-        break;
-      case 0b1100:
-        break;
-      default:
-        rotationVariable = 0;
-        break;
-    }
-    //Assign the current state to the previous state once decoding is complete
-    prevState[0] = cols[0];
-    prevState[1] = cols[1];
+    currentState[0] = cols[0];
+    currentState[1] = cols[1];
     // update rotation  
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);  
-    if (sysState.rotation + rotationVariable < 9 && sysState.rotation + rotationVariable >= 0) { // upper and lower limits
-      sysState.rotation += rotationVariable;
-      if (localCurrentStepSize != 0){ // only update when a key is pressed
-        TX_Message[1] = sysState.rotation; // 	store Octave number 0-8
-      }
+    knob3.updateRotation(currentState);
+    currentState[0] = cols[2];
+    currentState[1] = cols[3];
+    knob2.updateRotation(currentState);
+    if (localCurrentStepSize != 0){ // only update when a key is pressed
+        TX_Message[1] = knob2.readRotation(); // 	store Octave number 0-8
     }
-    xSemaphoreGive(sysState.mutex);
     // CAN_TX(0x123, TX_Message); // send the message over the bus. CAN message ID is fixed as 0x123 
     /*
     If you look in the library you’ll see that the above function (CAN_TX(0x123, TX_Message);) polls until there is space in the outgoing mailbox to place the message in. 
@@ -303,7 +306,7 @@ void scanKeysTask(void * pvParameters) {
     It also not a thread safe function and its behaviour could be undefined if messages are being sent from two different threads. 
     A queue is useful here too so that messages can be queued up for transmission.
     */
-    xQueueSend( msgOutQ, TX_Message, portMAX_DELAY); // RTOS function to place an item on the transmit queue
+    xQueueSend(msgOutQ, TX_Message, portMAX_DELAY); // RTOS function to place an item on the transmit queue
   }
 }
 
@@ -325,12 +328,16 @@ void displayUpdateTask(void * pvParameters){
     u8g2.print(sysState.inputs.to_ulong(),HEX); 
     xSemaphoreGive(sysState.mutex);
 
-    // knob 3
+    // knob 2
     u8g2.setCursor(30,20);
-    xSemaphoreTake(sysState.mutex, portMAX_DELAY);  
-    u8g2.print(sysState.rotation, DEC);
-    xSemaphoreGive(sysState.mutex);
-    // u8g2.print(knob3.readRotation()); // reads current rotation value
+    u8g2.print(knob2.readRotation(), DEC);
+
+    // knob 3
+    u8g2.setCursor(40,20);
+    u8g2.print(knob3.readRotation(), DEC);
+    // xSemaphoreTake(sysState.mutex, portMAX_DELAY);   // reads current rotation value
+    // u8g2.print(sysState.rotation, DEC);
+    // xSemaphoreGive(sysState.mutex);
 
     // display octave and note number
     // while (CAN_CheckRXLevel()){ 
@@ -392,15 +399,12 @@ void CAN_TX_Task (void * pvParameters) { // two blocking statements because it m
 	}
 }
 
-// ISR which will give the semaphore each time a mailbox becomes available
-void CAN_TX_ISR (void) {
-	xSemaphoreGiveFromISR(CAN_TX_Semaphore, NULL);
-}
+//====================================================SETUP=====================================================
+
 // determine the amount of stack to allocate to a thread:
 // uxTaskGetStackHighWaterMark() returns the largest amount of stack that a thread has ever needed. 
 //You can allocate a large stack at first and then optimise when the code is working. 
 // You need to ensure that all the code has been exercised before you report the stack high water mark.
-
 void setup() {
   // put your setup code here, to run once:
 
@@ -436,29 +440,34 @@ void setup() {
   sysState.mutex = xSemaphoreCreateMutex();
 
   // initialise CAN bus
-  CAN_Init(true); //True: loopback mode. receive and acknowledge its own messages. 
+  CAN_Init(loopbackState); //True: loopback mode. receive and acknowledge its own messages. 
                   // False: disables loopback mode and allow the MCUs to receive each others’ messages.
   setCANFilter(0x123,0x7ff);  //initialises the reception ID filter. only messages with the ID 0x123 will be received. 
                               // The second parameter is the mask, and 0x7ff means that every bit of the ID must match the filter for the message to be accepted
+  #ifndef DISABLE_CAN_ISR
   CAN_RegisterRX_ISR(CAN_RX_ISR); // called whenever a CAN message is received by passing a pointer to the relevant library function.
   CAN_RegisterTX_ISR(CAN_TX_ISR);
+  #endif
   CAN_Start();
 
   // initialise queue handler for CAN bus msgs
   msgInQ = xQueueCreate(36,8); // Minimum time to send a CAN frame is ~0.7ms, so a queue length of 36 will take at least 25ms to fill; 
                                 // second param: size of each item in BYTES.
-  msgOutQ = xQueueCreate(36, 8);
+  msgOutQ = xQueueCreate(36, 8); // 36 normal. 386 for TEST_SCANKEYS
   //  maxCount == 3 so it can’t accumulate a count greater than the number of mailboxes. Why need both init and max? why not assume init is max?
   CAN_TX_Semaphore = xSemaphoreCreateCounting(3,3); // initialised to 3, so can be taken 3 times by transmit thread, and blocked on the fourth attempt.
 
-  // uncomment for sound. Its the timer
+  // For sound. Its the timer
+  #ifndef DISABLE_SOUND_ISR
   TIM_TypeDef *Instance = TIM1;
   HardwareTimer *sampleTimer = new HardwareTimer(Instance);
   sampleTimer->setOverflow(22000, HERTZ_FORMAT);
   sampleTimer->attachInterrupt(sampleISR);
   sampleTimer->resume();
+  #endif
 
   // threads
+  #ifndef DISABLE_THREADS
   TaskHandle_t displayUpdateHandle = NULL;
   xTaskCreate(
     displayUpdateTask,		/* Function that implements the task */
@@ -500,6 +509,16 @@ void setup() {
   );
 
   vTaskStartScheduler();
+  #endif
+
+  #ifdef TEST_SCANKEYS
+    uint32_t startTime = micros();
+    for (int iter = 0; iter < 32; iter++) {
+      scanKeysTask(NULL);
+    }
+    Serial.println(micros()-startTime);
+    while(1);
+  #endif
 }
 
 void loop() {
