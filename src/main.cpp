@@ -277,19 +277,23 @@ void scanKeysTask(void * pvParameters) {
       // should use switch cases, this is a bad implementation
       // also can MAYBE use the C function memcpy() or C++ std::copy for this purpose. 
       for (int j=0; j<4; j++){
-        sysState.inputs[4*i+j] = cols[j];
         #ifdef TEST_SCANKEYS
         cols[j] = 1;
         #endif
-        if (cols[j]==0){
-          localCurrentStepSize = stepSizes[4*i+j];
-          TX_Message[2] = 4*i+j; // store	Note number 0-11
-        }
+        sysState.inputs[4*i+j] = cols[j];
+        // if (cols[j]==0){
+        //   localCurrentStepSize = stepSizes[4*i+j];            //Polyphony: may need to change this
+        //   TX_Message[2] = 4*i+j; // store	Note number 0-11
+        // }
       }
+      // Polyphony: if a key is pressed, that bit == 1. This is really the last 12 bits of sysState.inputs
+      TX_Message[3] = static_cast<uint8_t>(~(sysState.inputs.to_ulong() & 0xFF));        // extract the last 8 bits
+      TX_Message[4] = static_cast<uint8_t>((~(sysState.inputs.to_ulong()>>8))& 0x0F);   // extract the next 8 bits
       xSemaphoreGive(sysState.mutex);
     }
-    __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
-    __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
+    // Polyphony: may need to change this for chords
+    // __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+    // __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
 
     // store state of key press or releases
     if (localCurrentStepSize == 0){
@@ -309,7 +313,7 @@ void scanKeysTask(void * pvParameters) {
     currentState[0] = cols[2];
     currentState[1] = cols[3];
     knob2.updateRotation(currentState);
-    if (localCurrentStepSize != 0){ // only update when a key is pressed
+    if ((sysState.RX_Message[4]<<8) +sysState.RX_Message[3] != 0){ // only update when a key is pressed. Polyphony changes were made.
         TX_Message[1] = knob2.readRotation(); // 	store Octave number 0-8
     }
     // CAN_TX(0x123, TX_Message); // send the message over the bus. CAN message ID is fixed as 0x123 
@@ -319,6 +323,7 @@ void scanKeysTask(void * pvParameters) {
     It also not a thread safe function and its behaviour could be undefined if messages are being sent from two different threads. 
     A queue is useful here too so that messages can be queued up for transmission.
     */
+   //TODO: should uodate only when there is a change
     xQueueSend(msgOutQ, TX_Message, portMAX_DELAY); // RTOS function to place an item on the transmit queue
 
     #ifdef TEST_SCANKEYS
@@ -361,6 +366,7 @@ void displayUpdateTask(void * pvParameters){
     u8g2.print((char) sysState.RX_Message[0]);
     u8g2.print(sysState.RX_Message[1]);
     u8g2.print(sysState.RX_Message[2]);
+    u8g2.print((sysState.RX_Message[4]<<8) +sysState.RX_Message[3], DEC);
     xSemaphoreGive(sysState.mutex);
 
     // display note played
@@ -404,6 +410,7 @@ void decodeTask(void * pvParameters){
         localCurrentStepSize = stepSizes[sysState.RX_Message[2]] << (sysState.RX_Message[1]-4);
       }
       __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+      __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
     }
     xSemaphoreGive(sysState.mutex);
   }
@@ -459,7 +466,7 @@ void setup() {
   // initialise CAN bus
   CAN_Init(loopbackState);    //True: loopback mode. receive and acknowledge its own messages. 
                               // False: disables loopback mode and allow the MCUs to receive each others’ messages.
-
+  // why 7ff??
   setCANFilter(0x123,0x7ff);  //initialises the reception ID filter. only messages with the ID 0x123 will be received. 
                               // The second parameter is the mask, and 0x7ff means that every bit of the ID must match the filter for the message to be accepted
   #ifndef DISABLE_CAN_ISR
