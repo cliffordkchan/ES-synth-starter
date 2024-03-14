@@ -25,7 +25,6 @@ skipped:
 //===========================================================Constants==================================================================
   const bool loopbackState = true;
   const uint32_t interval = 100; //Display update interval
-  // const uint32_t stepSizes [] = {51076056, 54113197, 57330935, 60740010, 64351799, 68178356, 72232452, 76527617, 81078186, 85899346, 91007189, 96418755};
   const double baseFreq = 440.0;
   const double TemperamentRatio = std::pow(2.0, 1.0/12.0);
   const uint32_t sampleFreq = 22000;
@@ -86,7 +85,8 @@ skipped:
   const int HKOE_BIT = 6;
 
 //=======================================================Global variables==========================================================
-  volatile uint32_t currentStepSize;
+  volatile uint32_t currentStepSize[10] = {0}; // Polyphonycchange. most people have 10 fingers
+  uint8_t currentStepSizeLength = sizeof(currentStepSize)/sizeof(currentStepSize[0]);
   QueueHandle_t msgInQ;               // queue handler for receiver
   QueueHandle_t msgOutQ;              // queue handler for transmission
   SemaphoreHandle_t CAN_TX_Semaphore; // transmit thread will use a semaphore to check when it can place a message in the outgoing mailbox
@@ -224,13 +224,24 @@ Knob knob2(0, 8, 0); // octave
 U8G2_SSD1305_128X32_NONAME_F_HW_I2C u8g2(U8G2_R0);
 
 // =================================================Interrupt services======================================================
-void sampleISR() {
-  static uint32_t phaseAcc = 0;
-  phaseAcc += currentStepSize;
-  int32_t Vout = (phaseAcc >> 24) - 128;
+void sampleISR() {  //polyphony mega changes
+  static uint32_t phaseAcc[10] = {0};
+  int32_t Vout[10] = {0};
+  int32_t Vout_polyphony;
+  for (int i = 0; i < currentStepSizeLength; i++){
+    phaseAcc[i] += currentStepSize[i];  
+    Vout[i] = (phaseAcc[i] >> 24) - 128;
+
+    if (Vout_polyphony+Vout[i] > 4294967295){         // cutoff
+      Vout_polyphony = 4294967295;
+    }
+    else{
+      Vout_polyphony += Vout[i];
+    }
+  }
   int8_t knob3Rotation = knob3.readRotation();
-  Vout = Vout >> (8 - knob3Rotation);
-  analogWrite(OUTR_PIN, Vout + 128);
+  Vout_polyphony = Vout_polyphony >> (8 - knob3Rotation);
+  analogWrite(OUTR_PIN, Vout_polyphony + 128);
 }
 
 // Incoming CAN messages will be written into the queue in this ISR
@@ -250,6 +261,7 @@ void CAN_TX_ISR (void) {
 // scans 12 keys + knobs
 void scanKeysTask(void * pvParameters) {
   // local vars
+  // bad coding practise used for sysState.RX_Message[4]<<8) +sysState.RX_Message[3] :)))) Polyphony
   const TickType_t xFrequency = 20/portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   std::bitset<4> cols;
@@ -291,16 +303,16 @@ void scanKeysTask(void * pvParameters) {
       TX_Message[4] = static_cast<uint8_t>((~(sysState.inputs.to_ulong()>>8))& 0x0F);   // extract the next 8 bits
       xSemaphoreGive(sysState.mutex);
     }
-    // Polyphony: may need to change this for chords
+    // Polyphony: may need to change this for chords. Imagine needing local data could never be me trollolololol
     // __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
     // __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
 
     // store state of key press or releases
-    if (localCurrentStepSize == 0){
-      TX_Message[0] = 'R';   // converts to 0x50 for P (key pressed), and 0x52 for R (Key released). ASCII
+    if ((TX_Message[4]<<8) + TX_Message[3] != 0){
+      TX_Message[0] = 'P';   // converts to 0x50 for P (key pressed), and 0x52 for R (Key released). ASCII
     }
     else{
-      TX_Message[0] = 'P';
+      TX_Message[0] = 'R';
     }
 
     // knob 3 and 2
@@ -313,7 +325,7 @@ void scanKeysTask(void * pvParameters) {
     currentState[0] = cols[2];
     currentState[1] = cols[3];
     knob2.updateRotation(currentState);
-    if ((sysState.RX_Message[4]<<8) +sysState.RX_Message[3] != 0){ // only update when a key is pressed. Polyphony changes were made.
+    if ((TX_Message[4]<<8) + TX_Message[3] != 0){ // only update when a key is pressed. Polyphony changes were made.
         TX_Message[1] = knob2.readRotation(); // 	store Octave number 0-8
     }
     // CAN_TX(0x123, TX_Message); // send the message over the bus. CAN message ID is fixed as 0x123 
@@ -336,6 +348,7 @@ void displayUpdateTask(void * pvParameters){
   const TickType_t xFrequency = 100/portTICK_PERIOD_MS;
   TickType_t xLastWakeTime = xTaskGetTickCount();
   uint32_t ID;
+  uint16_t pressedNotes = (sysState.RX_Message[4]<<8) +sysState.RX_Message[3]; // in the form 0b0100... 
   while (1){
     #ifndef TEST_DISPLAY
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
@@ -365,14 +378,19 @@ void displayUpdateTask(void * pvParameters){
     xSemaphoreTake(sysState.mutex, portMAX_DELAY);  
     u8g2.print((char) sysState.RX_Message[0]);
     u8g2.print(sysState.RX_Message[1]);
-    u8g2.print(sysState.RX_Message[2]);
-    u8g2.print((sysState.RX_Message[4]<<8) +sysState.RX_Message[3], DEC);
+    // u8g2.print(sysState.RX_Message[2]);
+    u8g2.print(pressedNotes, DEC);
     xSemaphoreGive(sysState.mutex);
 
-    // display note played
+    // display note played. THis no longer works after polyphony
     u8g2.setCursor(2,30);
     xSemaphoreTake(sysState.mutex, portMAX_DELAY); 
-    u8g2.print(notesMap[sysState.RX_Message[2]].c_str());
+    for (int i=0; i < 12; i++){
+      if (pressedNotes%2==1){
+        u8g2.print(notesMap[i].c_str());
+      }
+      pressedNotes = pressedNotes >> 1;
+    }
     xSemaphoreGive(sysState.mutex);
 
     // transfer internal memory to the display
@@ -387,30 +405,54 @@ void displayUpdateTask(void * pvParameters){
   }
 }
 
+// Polyphony mega changes. for loops added for updating currentStepSize, which is now an array
 void decodeTask(void * pvParameters){
   uint32_t localCurrentStepSize;
   uint8_t local_RX_Message[8]={0};
+  uint16_t keyState = 0;
+  uint8_t currentStepSizeIndex;
   while(1){
+    localCurrentStepSize = 0;
     xQueueReceive(msgInQ, local_RX_Message, portMAX_DELAY);
-
     // see if this is a bad use of mutex, cuz there's another atomic store in here. Can I not just use local_RX_Message for the conditionals lol
     xSemaphoreTake(sysState.mutex, portMAX_DELAY); 
     for (int i = 0; i < 8; i++) {
       sysState.RX_Message[i] = local_RX_Message[i];
     }
+
+    keyState = (sysState.RX_Message[4]<<8) + sysState.RX_Message[3]; // in the form 0b00100001
+
     if (sysState.RX_Message[0] == 'R'){
-      currentStepSize = 0;
+      currentStepSizeIndex = 0;
+      for (int i = 0; i < currentStepSizeLength-1; i++){ // need to go through whole thing
+        currentStepSize[i] = 0;
+      }
     }
     else {
       // Changes octave.
-      if (sysState.RX_Message[1]-4 < 0){
-        localCurrentStepSize = stepSizes[sysState.RX_Message[2]] >> (4-sysState.RX_Message[1]);
+      // Polyphony: does not use [2] anymore, will have to change depending on how bytes are used
+      // PS this is some horrible code and I feel closer to death for every passing minute
+      currentStepSizeIndex = 0;
+      for (int i = 0; i < 12; i++){
+        if (keyState%2==1){
+          if (sysState.RX_Message[1]-4 < 0){
+            localCurrentStepSize = stepSizes[i] >> (4-sysState.RX_Message[1]); 
+            __atomic_store_n(&currentStepSize[currentStepSizeIndex], localCurrentStepSize, __ATOMIC_RELAXED);
+            __atomic_load(&currentStepSize[currentStepSizeIndex], &localCurrentStepSize, __ATOMIC_RELAXED);
+          }
+          else if (sysState.RX_Message[1]-4 >= 0){
+            localCurrentStepSize = stepSizes[i] << (sysState.RX_Message[1]-4);
+            __atomic_store_n(&currentStepSize[currentStepSizeIndex], localCurrentStepSize, __ATOMIC_RELAXED);
+            __atomic_load(&currentStepSize[currentStepSizeIndex], &localCurrentStepSize, __ATOMIC_RELAXED);
+          }
+          currentStepSizeIndex += 1;
+          if (currentStepSizeIndex > 9){
+            currentStepSizeIndex = 9;     // I am reluctant to ever increase the size of this array, as it could be bad
+          }
+        }
+        keyState = keyState >> 1;
       }
-      else{
-        localCurrentStepSize = stepSizes[sysState.RX_Message[2]] << (sysState.RX_Message[1]-4);
-      }
-      __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
-      __atomic_load(&currentStepSize, &localCurrentStepSize, __ATOMIC_RELAXED);
+      //what is Vmax tho??
     }
     xSemaphoreGive(sysState.mutex);
   }
